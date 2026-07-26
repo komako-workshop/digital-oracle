@@ -6,10 +6,14 @@ fund flow and sector rotation. Free, keyless, JSON.
 
 from __future__ import annotations
 
+import os
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
+from digital_oracle.cache import TTLCache
 from digital_oracle.http import JsonHttpClient, UrllibJsonClient
+from digital_oracle.proxy_pool import ProxyPool
 
 from ._coerce import _coerce_float, _coerce_int
 from .base import ProviderError, ProviderParseError, SignalProvider
@@ -33,6 +37,20 @@ HISTORY_HOSTS = ("https://push2his.eastmoney.com", "https://push2delay.eastmoney
 TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 _TENCENT_PERIODS = {"daily": "day", "weekly": "week", "monthly": "month"}
 _TENCENT_ADJUST = {"none": "", "forward": "qfq", "backward": "hfq"}
+
+_PROXY_ENV = ("EASTMONEY_PROXIES", "DIGITAL_ORACLE_PROXIES")
+
+# Cache windows chosen from how often the upstream data actually changes, not
+# from how often it is asked for. Sector ranking is the big win: every A-share
+# question pulls the same market-wide table.
+QUOTE_TTL_SECONDS = float(os.environ.get("EASTMONEY_QUOTE_TTL", "60"))
+SECTOR_TTL_SECONDS = float(os.environ.get("EASTMONEY_SECTOR_TTL", "300"))
+FUND_FLOW_TTL_SECONDS = float(os.environ.get("EASTMONEY_FUND_FLOW_TTL", "1800"))
+KLINE_TTL_SECONDS = float(os.environ.get("EASTMONEY_KLINE_TTL", "1800"))
+
+# A throttled Eastmoney host answers immediately with 502, so retrying it on
+# every call is both free-looking and exactly what sustains the throttle.
+HOST_COOLDOWN_SECONDS = float(os.environ.get("EASTMONEY_HOST_COOLDOWN", "300"))
 
 # Eastmoney rejects the stdlib default agent, so every request needs a browser UA.
 _BROWSER_HEADERS = {
@@ -219,9 +237,24 @@ class EastmoneyProvider(SignalProvider):
         "sector_fund_flow",
     )
 
-    def __init__(self, http_client: JsonHttpClient | None = None) -> None:
+    def __init__(
+        self,
+        http_client: JsonHttpClient | None = None,
+        *,
+        cache: TTLCache | None = None,
+        proxy_pool: ProxyPool | None = None,
+    ) -> None:
         self.http_client: JsonHttpClient = http_client or UrllibJsonClient(
-            headers=_BROWSER_HEADERS
+            headers=_BROWSER_HEADERS,
+            proxy_pool=proxy_pool if proxy_pool is not None else ProxyPool.from_env(*_PROXY_ENV),
+        )
+        self.cache = cache if cache is not None else TTLCache()
+        self._host_down_until: dict[str, float] = {}
+
+    def _cached_json(self, ttl: float, url: str, params: Mapping[str, Any]) -> Any:
+        key = (url, tuple(sorted((k, str(v)) for k, v in params.items())))
+        return self.cache.get_or_call(
+            key, ttl, lambda: self.http_client.get_json(url, params=params)
         )
 
     def _fetch(
@@ -230,6 +263,7 @@ class EastmoneyProvider(SignalProvider):
         path: str,
         params: Mapping[str, Any],
         *,
+        ttl: float = 0.0,
         require: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> Mapping[str, Any]:
         """Try each host in turn; ``require`` rejects a 200 that carries no rows.
@@ -239,19 +273,37 @@ class EastmoneyProvider(SignalProvider):
         chart instead of a failure worth reporting.
         """
         failures = []
-        for host in hosts:
+        for host in self._ordered_hosts(hosts):
             try:
-                data = _payload(self.http_client.get_json(host + path, params=params))
+                data = _payload(self._cached_json(ttl, host + path, params))
             except ProviderParseError:
                 raise
             except Exception as exc:  # noqa: BLE001 — try the next host, report all
+                self._mark_host_down(host)
                 failures.append(f"{host}: {type(exc).__name__}: {exc}")
                 continue
             if require is not None and not require(data):
+                self._mark_host_down(host)
                 failures.append(f"{host}: responded 200 but carried no rows")
                 continue
+            self._mark_host_up(host)
             return data
         raise ProviderError("every Eastmoney host failed — " + "; ".join(failures))
+
+    def _ordered_hosts(self, hosts: Sequence[str]) -> list[str]:
+        """Healthy hosts first. A throttled host answers fast and keeps the
+        throttle alive, so retrying it on every call is the expensive mistake —
+        park it and go straight to the one that is working."""
+        now = time.monotonic()
+        healthy = [h for h in hosts if self._host_down_until.get(h, 0.0) <= now]
+        cooling = [h for h in hosts if self._host_down_until.get(h, 0.0) > now]
+        return healthy + cooling
+
+    def _mark_host_down(self, host: str) -> None:
+        self._host_down_until[host] = time.monotonic() + HOST_COOLDOWN_SECONDS
+
+    def _mark_host_up(self, host: str) -> None:
+        self._host_down_until.pop(host, None)
 
     def get_quote(self, query: EastmoneyQuoteQuery) -> EastmoneyQuote:
         data = self._fetch(
@@ -261,6 +313,7 @@ class EastmoneyProvider(SignalProvider):
                 "secid": to_secid(query.symbol),
                 "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f59,f60,f116,f117,f162,f167,f168,f169,f170",
             },
+            ttl=QUOTE_TTL_SECONDS,
         )
         decimals = _coerce_int(data.get("f59"))
         return EastmoneyQuote(
@@ -295,10 +348,14 @@ class EastmoneyProvider(SignalProvider):
             )
         limit = max(1, query.limit)
         failures = []
+        tencent_ok = self._host_down_until.get(TENCENT_KLINE_URL, 0.0) <= time.monotonic()
         try:
-            payload = self.http_client.get_json(
+            if not tencent_ok:
+                raise ProviderError("Tencent cooling down after a recent failure")
+            payload = self._cached_json(
+                KLINE_TTL_SECONDS,
                 TENCENT_KLINE_URL,
-                params={
+                {
                     "param": ",".join(
                         [
                             to_tencent_symbol(query.symbol),
@@ -314,6 +371,7 @@ class EastmoneyProvider(SignalProvider):
             bars = _tencent_bars(
                 payload, _TENCENT_PERIODS[query.period], _TENCENT_ADJUST[query.adjust]
             )
+            self._mark_host_up(TENCENT_KLINE_URL)
             return EastmoneyKline(
                 symbol=to_secid(query.symbol).partition(".")[2],
                 name="",  # Tencent's kline payload carries no display name
@@ -325,6 +383,8 @@ class EastmoneyProvider(SignalProvider):
             # Includes parse errors: for a fallback chain, a malformed response
             # from the preferred source is a reason to try the next one, not to
             # fail the call.
+            if tencent_ok:
+                self._mark_host_down(TENCENT_KLINE_URL)
             failures.append(f"{TENCENT_KLINE_URL}: {type(exc).__name__}: {exc}")
 
         data = self._fetch(
@@ -339,6 +399,7 @@ class EastmoneyProvider(SignalProvider):
                 "end": "20500101",
                 "lmt": limit,
             },
+            ttl=KLINE_TTL_SECONDS,
             require=_has_rows,
         )
         bars = []
@@ -374,6 +435,7 @@ class EastmoneyProvider(SignalProvider):
                 "klt": "101",
                 "lmt": max(1, query.limit),
             },
+            ttl=FUND_FLOW_TTL_SECONDS,
             require=_has_rows,
         )
         days = []
@@ -419,6 +481,7 @@ class EastmoneyProvider(SignalProvider):
                 "fs": board,
                 "fields": "f3,f12,f14,f62,f184",
             },
+            ttl=SECTOR_TTL_SECONDS,
         )
         rows = data.get("diff")
         if not isinstance(rows, Sequence):

@@ -449,6 +449,19 @@ s = em.list_sector_fund_flow(EastmoneySectorFlowQuery(kind="industry", limit=20)
 - 没有任何预测市场给 A 股个股定价——要概率只能从持仓与波动率推，查不到现成的。
 - 东财按来源 IP 限流，机房出口连发几十次就会开始 502 / 断连。行情、资金流、板块
   三类会自动回退到延时主机 `push2delay`（行情延迟约 15 分钟）。
+- **限流的成本主要来自重复请求，不是请求总量。** provider 内置两层削减：
+  - **TTL 缓存**（进程内，按 worker 各一份）：行情 60s、板块 300s、资金流与 K 线
+    各 1800s。板块表是最大的一笔——每次 A 股提问都要，而它对所有人是同一份数据。
+  - **主机熔断**：某台主机失败后停用 300s。限流中的主机会**立刻**回 502，看着很
+    便宜，但每次调用都去打它正是限流续命的原因。
+  实测（在被限流的机器上）：55 次逻辑调用只产生 16 次上游请求，40 次调用的耗时
+  从 17.1s 降到 2.5s。TTL 与熔断时长可用 `EASTMONEY_QUOTE_TTL`、
+  `EASTMONEY_SECTOR_TTL`、`EASTMONEY_FUND_FLOW_TTL`、`EASTMONEY_KLINE_TTL`、
+  `EASTMONEY_HOST_COOLDOWN` 覆盖。
+- **代理轮换**：设 `EASTMONEY_PROXIES`（逗号分隔，如
+  `http://user:pass@host:8080,http://host2:8080`）即可把出口分散到多个地址，
+  失败的代理冷却 120s，直连始终作为最后兜底。**默认为空**——公开免费代理既不可靠，
+  又会让查询流量经过陌生主机，需要自备可信代理源才建议开启。
 - **`get_history` 的主源是腾讯，不是东财。** `push2his` 是东财限流最狠的一台，
   而延时主机对 K 线路径返回 200 但 `klines` 为空数组——对这一个调用东财是弱源。
   腾讯 `web.ifzq.gtimg.cn` 没有这个限制，字段顺序一致（少一个成交额，所以走腾讯时

@@ -221,6 +221,28 @@ class HostFallbackTests(unittest.TestCase):
         self.assertIn("carried no rows", str(ctx.exception))
         self.assertEqual(len(client.calls), 3)  # Tencent + both Eastmoney hosts
 
+    def test_dead_host_is_probed_once_not_on_every_call(self) -> None:
+        """Retrying a throttled host on every call is what sustains the throttle."""
+        client = FakeJsonClient(SAMPLE_QUOTE, fail_hosts=("push2.eastmoney.com",))
+        provider = EastmoneyProvider(http_client=client)
+        for _ in range(5):
+            provider.cache.clear()  # isolate host behaviour from response caching
+            provider.get_quote(EastmoneyQuoteQuery(symbol="002156"))
+        dead = [u for u, _ in client.calls if "push2.eastmoney.com" in u]
+        alive = [u for u, _ in client.calls if "push2delay" in u]
+        self.assertEqual(len(dead), 1, "throttled host should be parked after one failure")
+        self.assertEqual(len(alive), 5)
+
+    def test_recovered_host_is_preferred_again(self) -> None:
+        client = FakeJsonClient(SAMPLE_QUOTE, fail_hosts=("push2.eastmoney.com",))
+        provider = EastmoneyProvider(http_client=client)
+        provider.get_quote(EastmoneyQuoteQuery(symbol="002156"))
+        client.fail_hosts = ()
+        provider._host_down_until.clear()  # simulate the cooldown elapsing
+        provider.cache.clear()
+        provider.get_quote(EastmoneyQuoteQuery(symbol="002156"))
+        self.assertIn("push2.eastmoney.com", client.calls[-1][0])
+
     def test_all_hosts_failing_reports_every_attempt(self) -> None:
         client = FakeJsonClient(SAMPLE_QUOTE, fail_hosts=("eastmoney.com",))
         provider = EastmoneyProvider(http_client=client)

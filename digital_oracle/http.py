@@ -6,7 +6,9 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
+
+from .proxy_pool import DIRECT, ProxyPool
 
 
 class HttpClientError(RuntimeError):
@@ -51,6 +53,9 @@ class UrllibJsonClient:
             "User-Agent": "digital-oracle/0.1",
         }
     )
+    #: Optional egress rotation for sources that throttle by client address.
+    #: Unset means every request goes out directly, exactly as before.
+    proxy_pool: ProxyPool | None = None
 
     def get_json(self, url: str, *, params: Mapping[str, object] | None = None) -> Any:
         request_url = self._build_request(url, params)
@@ -75,9 +80,41 @@ class UrllibJsonClient:
         return Request(request_url, headers=dict(self.headers))
 
     def _open(self, request: Request):
+        if self.proxy_pool is None or not self.proxy_pool.configured:
+            return self._open_via(request, DIRECT)
+
+        # urllib mutates a Request in place while opening it — ProxyHandler
+        # rewrites .host and sets tunnel state — so a Request that has been
+        # through a proxy cannot be reused for the next attempt.
+        url = request.full_url
+        last_error: Exception | None = None
+        for endpoint in self.proxy_pool.candidates():
+            try:
+                response = self._open_via(Request(url, headers=dict(self.headers)), endpoint)
+            except HTTPError as exc:
+                # A throttle answers with a status code, so it has to burn the
+                # proxy too — otherwise rotation never kicks in for the exact
+                # case it exists for.
+                self.proxy_pool.mark_failure(endpoint)
+                last_error = exc
+                continue
+            except Exception as exc:  # noqa: BLE001 — try the next endpoint
+                self.proxy_pool.mark_failure(endpoint)
+                last_error = exc
+                continue
+            self.proxy_pool.mark_success(endpoint)
+            return response
+        if isinstance(last_error, HTTPError):
+            raise last_error
+        raise HttpClientError(f"request failed: {request.full_url}") from last_error
+
+    def _open_via(self, request: Request, proxy: str):
+        opener = build_opener(ProxyHandler({"http": proxy, "https": proxy})) if proxy else None
         last_error: Exception | None = None
         for attempt in range(1, self.retry_attempts + 1):
             try:
+                if opener is not None:
+                    return opener.open(request, timeout=self.timeout_seconds)
                 return urlopen(request, timeout=self.timeout_seconds)
             except HTTPError:
                 raise
