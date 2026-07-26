@@ -57,7 +57,7 @@ Based on question type, select from the signal menu below. **Don't use just one 
 - Deribit: BTC futures basis (risk appetite proxy)
 - CoinGecko: Crypto total market cap + BTC dominance (risk appetite proxy)
 - FearGreedProvider: CNN Fear & Greed Index (7 price signals composite → 0-100)
-- CMEFedWatchProvider: Market-implied FOMC rate change probabilities from futures
+- Kalshi `KXFED` series: FOMC rate-decision contracts. (Use this for the rate path — CMEFedWatchProvider is currently 403-blocked by CME's bot protection from every host tested.)
 - Polymarket: Recession-related contracts, central bank rate path
 - Currencies: DXY/dollar strength, emerging market currencies
 - Web search: High-yield bond spread (HY OAS), TED spread, MOVE index, TTF gas, BDI freight rates
@@ -96,6 +96,20 @@ Based on question type, select from the signal menu below. **Don't use just one 
 - FearGreedProvider: CNN Fear & Greed Index
 - Web search: VIX level, margin debt level, leveraged ETF concentration
 
+#### China A-share: individual stock / ETF / sector
+Mainland listings are quoted in CNY on exchanges no US venue prices, so the usual
+Polymarket/Kalshi/CFTC layer has nothing to say about them. Route these to Eastmoney.
+
+- Eastmoney `get_quote`: Live quote for a 6-digit code → last, change %, turnover rate, PE(TTM), PB, market cap. Pass the bare code (`600519`, `000977`) — `to_secid` resolves the exchange.
+- Eastmoney `get_fund_flow`: **The signal with actual skin in the game.** Daily net inflow split by order size — extra-large / large (together = 主力, institutional) vs medium / small (retail). Institutions buying while retail sells is a different tape than the reverse, and price alone cannot show it.
+- Eastmoney `list_sector_fund_flow`: Industry or concept boards ranked by institutional net inflow → which sector money is rotating into. Answers "which sector is seeing inflows" directly.
+- Eastmoney `get_history`: OHLCV with forward adjustment (`adjust="forward"`) → realized volatility, trend, volume confirmation.
+- YahooPriceProvider: Same listings via `600519.SS` / `000977.SZ` suffixes — useful as a cross-check, and the only way to put an A-share on the same axis as a US comparable.
+- FXI / USDCNY=X: Foreign risk appetite toward Chinese assets and capital-flow direction — the offshore view on the same question.
+- Sector read-through: For semiconductors / AI hardware, cross-check US comparables (NVDA, AMD, SOXX) since the supply chain is shared.
+
+Two cautions. Eastmoney publishes fund flow **after the close**, so intraday questions get yesterday's tape. And no prediction market prices Chinese single names — if the user wants a probability, it has to be reasoned from positioning and volatility, not looked up.
+
 **Available trading symbols directory:** See [references/symbols.md](references/symbols.md)
 **Provider API reference:** See [references/providers.md](references/providers.md)
 
@@ -128,7 +142,8 @@ from digital_oracle import (
     WorldBankProvider, WorldBankQuery,
     YFinanceProvider, OptionsChainQuery,      # requires uv pip install yfinance
     FearGreedProvider,
-    CMEFedWatchProvider,
+    EastmoneyProvider, EastmoneyQuoteQuery, EastmoneyKlineQuery,
+    EastmoneyFundFlowQuery, EastmoneySectorFlowQuery,
     gather,
 )
 
@@ -140,12 +155,12 @@ treasury = USTreasuryProvider()
 web = WebSearchProvider()
 cftc = CftcCotProvider()
 coingecko = CoinGeckoProvider()
-edgar = EdgarProvider(user_email="you@example.com")  # SEC requires email in User-Agent, otherwise 403
+edgar = EdgarProvider()  # set EDGAR_USER_EMAIL to identify yourself to SEC; a contact is required or it 403s
 bis = BisProvider()
 wb = WorldBankProvider()
 yf = YFinanceProvider()  # requires uv pip install yfinance
 fear_greed = FearGreedProvider()
-fedwatch = CMEFedWatchProvider()
+eastmoney = EastmoneyProvider()  # China A-share: quotes, OHLCV, fund flow, sector rotation
 
 result = gather({
     "pm_events": lambda: pm.list_events(PolymarketEventQuery(slug_contains="...", limit=10)),
@@ -169,8 +184,10 @@ result = gather({
     "spy_options": lambda: yf.get_chain(OptionsChainQuery(ticker="SPY", expiration="2026-04-17")),
     # CNN Fear & Greed (composite of 7 price signals)
     "fear_greed": lambda: fear_greed.get_index(),
-    # CME FedWatch (implied rate probabilities from futures)
-    "fedwatch": lambda: fedwatch.get_probabilities(),
+    # China A-share: institutional vs retail flow, and which sector money rotated into
+    "cn_stock": lambda: eastmoney.get_quote(EastmoneyQuoteQuery(symbol="002156")),
+    "cn_flow": lambda: eastmoney.get_fund_flow(EastmoneyFundFlowQuery(symbol="002156", limit=10)),
+    "cn_sectors": lambda: eastmoney.list_sector_fund_flow(EastmoneySectorFlowQuery(limit=15)),
     # Web search runs in parallel with structured providers
     "vix": lambda: web.search("VIX index current level"),
     "hy_spread": lambda: web.search("US high yield bond spread OAS"),
@@ -205,9 +222,10 @@ if chain:
 | WorldBankProvider | Development indicators | GDP, population, trade, macro data | stdlib |
 | YFinanceProvider | US options chains | IV, Greeks, put/call ratio, max pain | yfinance |
 | **FearGreedProvider** | **Market sentiment** | **CNN 7-signal composite → 0-100 score** | **stdlib** |
-| **CMEFedWatchProvider** | **Rate probabilities** | **FOMC rate change implied from futures** | **stdlib** |
+| **EastmoneyProvider** | **China A-share** | **Quotes, OHLCV, order-size fund flow, sector rotation** | **stdlib** |
+| CMEFedWatchProvider | Rate probabilities | **Currently 403-blocked by CME — use Kalshi `KXFED`** | stdlib |
 
-> 12 out of 14 providers have zero external dependencies and zero API keys. YahooPriceProvider and YFinanceProvider require `pip install yfinance`.
+> 13 out of 15 providers have zero external dependencies and zero API keys. YahooPriceProvider and YFinanceProvider require `pip install yfinance`.
 
 **WebSearchProvider usage:**
 - `web.search("query")` → returns `WebSearchResult` (search summary) — render with `.text()`
@@ -326,5 +344,8 @@ Four analysis dimensions:
 - Kalshi does NOT support keyword search — use `series_ticker` or `event_ticker` to filter markets. Find tickers by browsing [kalshi.com](https://kalshi.com) or listing markets without filters first. Common series: `KXFED` (Fed rates), `KXINX` (S&P 500 range), `KXGDP` (GDP)
 - Deribit futures method is `get_futures_term_structure()`, not `get_futures_curve()`. Option chain method is `get_option_chain()`
 - FearGreedProvider has no API key requirement. Returns a single composite score (0-100) synthesizing 7 market price signals: stock momentum, breadth, VIX, put/call ratio, junk bond demand, volatility, safe haven demand. Score < 25 = Extreme Fear, > 75 = Extreme Greed
-- CMEFedWatchProvider has no API key requirement. Returns implied rate change probabilities for upcoming FOMC meetings, derived from 30-day Fed Funds futures prices. Note: the CME endpoint may occasionally be unavailable or change format — if it fails, fall back to Kalshi `KXFED` series for rate probabilities
+- CMEFedWatchProvider is **currently unusable**: CME's bot protection returns 403 to every User-Agent tested, from residential and datacenter hosts alike. Don't spend a round-trip on it — go straight to Kalshi `KXFED` for the rate path
+- EdgarProvider needs a contact in the User-Agent or SEC returns 403. It now defaults to one, but set `EDGAR_USER_EMAIL` to identify yourself properly under SEC's fair-access policy
+- BIS `get_credit_to_gdp()` returns the **gap** (deviation from long-run trend, e.g. US ≈ -12pp), not the raw credit-to-GDP ratio (≈ 140%). Pass `series=CREDIT_GAP_SERIES["ratio"]` if you want the level instead. A double-digit positive gap is the classic credit-bubble warning
+- EastmoneyProvider takes bare 6-digit A-share codes; `to_secid()` resolves the exchange (`6xxxxx`/`5xxxxx`/`9xxxxx` → Shanghai, everything else → Shenzhen). Fund flow amounts are CNY and publish after the close. `main_net` = `extra_large_net` + `large_net`, i.e. institutional; `medium`/`small` are retail
 - When reporting dollar amounts, use `USD` instead of `$` to avoid markdown renderers interpreting `$...$` as LaTeX

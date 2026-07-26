@@ -30,10 +30,19 @@ class BisPolicyRate:
     rate: float
 
 
+#: BIS ``CG_DTYPE`` codes for the WS_CREDIT_GAP flow.
+CREDIT_GAP_SERIES = {
+    "gap": "C",  # credit-to-GDP gap, in percentage points
+    "ratio": "A",  # credit-to-GDP ratio
+    "trend": "B",  # long-run HP-filtered trend of the ratio
+}
+
+
 @dataclass(frozen=True)
 class BisCreditGapQuery:
     countries: tuple[str, ...] = ("US",)
     start_year: int = 2015
+    series: str = CREDIT_GAP_SERIES["gap"]
 
 
 @dataclass(frozen=True)
@@ -68,7 +77,10 @@ class BisProvider(SignalProvider):
     def get_credit_to_gdp(self, query: BisCreditGapQuery | None = None) -> list[BisCreditGap]:
         query = query or BisCreditGapQuery()
         country_codes = "+".join(query.countries)
-        url = f"{BIS_BASE_URL}/data/WS_CREDIT_GAP/Q.{country_codes}"
+        # Dimensions are FREQ.BORROWERS_CTY.TC_BORROWERS.TC_LENDERS.CG_DTYPE.
+        # Pinning CG_DTYPE is what separates the gap (≈ -12 for the US) from the
+        # raw credit-to-GDP ratio (≈ 142); leaving it open returns the ratio.
+        url = f"{BIS_BASE_URL}/data/WS_CREDIT_GAP/Q.{country_codes}.P.A.{query.series}"
         payload = self.http_client.get_text(
             url,
             params={

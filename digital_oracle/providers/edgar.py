@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -10,6 +11,7 @@ from .base import ProviderError, ProviderParseError, SignalProvider
 EDGAR_SUBMISSIONS_URL = "https://data.sec.gov/submissions"
 EDGAR_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 EDGAR_SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
+DEFAULT_CONTACT_EMAIL = "digital-oracle@example.com"
 
 
 @dataclass(frozen=True)
@@ -78,7 +80,11 @@ class EdgarProvider(SignalProvider):
         if http_client is None:
             # SEC EDGAR requires User-Agent with contact email to avoid 403.
             # See: https://www.sec.gov/os/accessing-edgar-data
-            ua = f"digital-oracle/0.1 ({user_email})" if user_email else "digital-oracle/0.1"
+            # A UA without an email-shaped contact is rejected outright, so fall
+            # back to EDGAR_USER_EMAIL and then to a project address rather than
+            # letting a bare EdgarProvider() 403 on every call.
+            contact = user_email or os.environ.get("EDGAR_USER_EMAIL") or DEFAULT_CONTACT_EMAIL
+            ua = f"digital-oracle/0.1 ({contact})"
             http_client = UrllibJsonClient(headers={
                 "Accept": "application/json",
                 "User-Agent": ua,

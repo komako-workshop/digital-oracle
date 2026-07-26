@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from datetime import date, timedelta
 from typing import Any
 
 from digital_oracle.providers.yfinance_provider import (
@@ -139,6 +140,12 @@ _FAKE_PUTS = [
         "inTheMoney": True,
     },
 ]
+
+
+# Greeks are only computed while time-to-expiry is positive, so any test that
+# asserts on them has to price an expiry that is still in the future *when the
+# suite runs* — a hardcoded date silently stops exercising that branch.
+FUTURE_EXPIRATION = (date.today() + timedelta(days=90)).isoformat()
 
 
 class FakeOptionsFetcher:
@@ -332,7 +339,7 @@ class YFinanceProviderTests(unittest.TestCase):
 
     def test_greeks_computed_when_enabled(self) -> None:
         chain = self.provider.get_chain(
-            OptionsChainQuery(ticker="AAPL", expiration="2026-04-17", compute_greeks=True)
+            OptionsChainQuery(ticker="AAPL", expiration=FUTURE_EXPIRATION, compute_greeks=True)
         )
         # All contracts should have Greeks (they all have IV)
         for c in chain.calls:
@@ -591,10 +598,10 @@ class EdgeCaseTests(unittest.TestCase):
         provider = YFinanceProvider(fetcher=fake)
 
         chain1 = provider.get_chain(
-            OptionsChainQuery(ticker="AAPL", expiration="2026-04-17", risk_free_rate=0.01)
+            OptionsChainQuery(ticker="AAPL", expiration=FUTURE_EXPIRATION, risk_free_rate=0.01)
         )
         chain2 = provider.get_chain(
-            OptionsChainQuery(ticker="AAPL", expiration="2026-04-17", risk_free_rate=0.10)
+            OptionsChainQuery(ticker="AAPL", expiration=FUTURE_EXPIRATION, risk_free_rate=0.10)
         )
         # ATM call delta should differ between the two rates
         g1 = chain1.calls[2].greeks  # 150 strike

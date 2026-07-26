@@ -10,6 +10,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from digital_oracle.providers.bis import (
+    CREDIT_GAP_SERIES,
     BisCreditGapQuery,
     BisProvider,
     BisRateQuery,
@@ -135,7 +136,7 @@ class BisProviderCreditGapTests(unittest.TestCase):
         )
 
         url, params = self.fake_client.calls[0]
-        self.assertIn("WS_CREDIT_GAP/Q.US+CN.C:G:P", url)
+        self.assertIn("WS_CREDIT_GAP/Q.US+CN.P.A.C", url)
         assert params is not None
         self.assertEqual(params["startPeriod"], 2015)
 
@@ -143,9 +144,17 @@ class BisProviderCreditGapTests(unittest.TestCase):
         self.provider.get_credit_to_gdp()
 
         url, params = self.fake_client.calls[0]
-        self.assertIn("WS_CREDIT_GAP/Q.US.C:G:P", url)
+        self.assertIn("WS_CREDIT_GAP/Q.US.P.A.C", url)
         assert params is not None
         self.assertEqual(params["startPeriod"], 2015)
+
+    def test_ratio_series_is_selectable(self) -> None:
+        self.provider.get_credit_to_gdp(
+            BisCreditGapQuery(countries=("US",), series=CREDIT_GAP_SERIES["ratio"])
+        )
+
+        url, _ = self.fake_client.calls[0]
+        self.assertIn("WS_CREDIT_GAP/Q.US.P.A.A", url)
 
 
 class BisProviderMetadataTests(unittest.TestCase):

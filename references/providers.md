@@ -17,7 +17,9 @@ from digital_oracle import (
     WorldBankProvider, WorldBankQuery,
     YFinanceProvider, OptionsChainQuery,      # pip install yfinance
     FearGreedProvider,
-    CMEFedWatchProvider,
+    EastmoneyProvider, EastmoneyQuoteQuery, EastmoneyKlineQuery,
+    EastmoneyFundFlowQuery, EastmoneySectorFlowQuery,
+    CMEFedWatchProvider,                      # 当前被 CME 反爬 403，改用 Kalshi KXFED
 )
 ```
 
@@ -396,7 +398,57 @@ snap = fg.get_index()
 
 **7 个组成信号：** 股票价格动量（S&P 500 vs 125日均线）、股票价格强度（52周新高/新低）、股票价格波幅（VIX）、Put/Call期权比率、垃圾债需求（高收益vs投资级利差）、市场波动率（VIX偏离度）、避险需求（股票vs债券收益率差）
 
+## EastmoneyProvider
+
+A 股行情、K 线、资金流与板块轮动。免费无 key，纯标准库。传裸 6 位代码即可，
+`to_secid()` 自动判交易所（`6xxxxx`/`5xxxxx`/`9xxxxx` 走上海，其余走深圳）。
+
+```python
+em = EastmoneyProvider()
+
+q = em.get_quote(EastmoneyQuoteQuery(symbol="002156"))
+# 返回 EastmoneyQuote
+# q.symbol, q.name              # "002156", "通富微电"
+# q.last, q.prev_close          # 最新价、昨收
+# q.open, q.high, q.low
+# q.change, q.change_pct        # 涨跌额、涨跌幅(%)
+# q.volume_lots                 # 成交量(手)
+# q.turnover_cny                # 成交额(元)
+# q.turnover_rate_pct           # 换手率(%)
+# q.pe_ttm, q.pb
+# q.market_cap_cny, q.float_market_cap_cny
+
+k = em.get_history(EastmoneyKlineQuery(symbol="002156", period="daily", adjust="forward", limit=120))
+# 返回 EastmoneyKline；period: daily|weekly|monthly，adjust: none|forward|backward
+# k.bars[i].date/open/close/high/low/volume_lots/turnover_cny
+
+f = em.get_fund_flow(EastmoneyFundFlowQuery(symbol="002156", limit=20))
+# 返回 EastmoneyFundFlow，按日拆单量级的净流入（人民币，正=净买入）
+# d.main_net          # 主力 = 超大单 + 大单，即机构
+# d.extra_large_net   # 超大单
+# d.large_net         # 大单
+# d.medium_net        # 中单（散户）
+# d.small_net         # 小单（散户）
+# d.main_net_pct      # 主力净占比(%)
+
+s = em.list_sector_fund_flow(EastmoneySectorFlowQuery(kind="industry", limit=20))
+# 返回 list[EastmoneySectorFlow]，按主力净流入降序；kind: industry|concept
+# x.code, x.name       # "BK1036", "半导体"
+# x.change_pct         # 板块涨跌幅(%)
+# x.main_net_cny       # 主力净流入(元)
+# x.main_net_pct       # 主力净占比(%)
+```
+
+**为什么这个 provider 不可替代：** 价格谁都能取，但「谁在买」只有拆单量级的资金流能看见。
+机构在吸筹而散户在跑，与反过来，是完全不同的两个盘面，而 K 线上这两者长得一样。
+
+**注意：** 资金流数据**收盘后**才更新，盘中提问拿到的是昨天的数据。另外没有任何预测市场
+给 A 股个股定价——要概率只能从持仓与波动率推，查不到现成的。
+
 ## CMEFedWatchProvider
+
+> ⚠️ **当前不可用。** CME 的反爬对所有测试过的 User-Agent 一律返回 403，住宅和机房出口都试过。
+> 利率路径请改用 Kalshi 的 `KXFED` 系列。
 
 CME FedWatch 利率期货隐含概率。从 30 天联邦基金利率期货价格推算。
 

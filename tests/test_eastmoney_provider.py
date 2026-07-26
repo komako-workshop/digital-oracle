@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+from typing import Any, Mapping
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from digital_oracle.providers.base import ProviderError, ProviderParseError
+from digital_oracle.providers.eastmoney import (
+    EastmoneyFundFlowQuery,
+    EastmoneyKlineQuery,
+    EastmoneyProvider,
+    EastmoneyQuoteQuery,
+    EastmoneySectorFlowQuery,
+    to_secid,
+)
+
+# Trimmed from a live push2.eastmoney.com response for 002156 (通富微电).
+SAMPLE_QUOTE = {
+    "rc": 0,
+    "data": {
+        "f43": 7664,
+        "f44": 7680,
+        "f45": 6803,
+        "f46": 6803,
+        "f47": 2634097,
+        "f48": 19_486_000_000.0,
+        "f57": "002156",
+        "f58": "通富微电",
+        "f59": 2,
+        "f60": 6982,
+        "f116": 116_300_000_000.0,
+        "f117": 115_000_000_000.0,
+        "f162": 8836,
+        "f167": 512,
+        "f168": 1736,
+        "f169": 682,
+        "f170": 977,
+    },
+}
+
+SAMPLE_KLINE = {
+    "rc": 0,
+    "data": {
+        "code": "002156",
+        "name": "通富微电",
+        "klines": [
+            "2026-07-22,71.71,74.90,76.23,70.88,2478838,18000000000.00",
+            "2026-07-23,75.99,69.82,76.78,69.30,2057105,15000000000.00",
+        ],
+    },
+}
+
+SAMPLE_FUND_FLOW = {
+    "rc": 0,
+    "data": {
+        "code": "002156",
+        "name": "通富微电",
+        "klines": [
+            "2026-07-22,2331000000.0,-920000000.0,-1411000000.0,-1263000000.0,3594000000.0,12.51,-4.94,-7.57,-6.78,19.29",
+        ],
+    },
+}
+
+SAMPLE_SECTOR = {
+    "rc": 0,
+    "data": {
+        "total": 496,
+        "diff": [
+            {"f3": -0.01, "f12": "BK1036", "f14": "半导体", "f62": 3305525504.0, "f184": 0.95},
+            {"f3": 1.87, "f12": "BK1328", "f14": "集成电路封测", "f62": 3234836736.0, "f184": 6.24},
+        ],
+    },
+}
+
+
+class FakeJsonClient:
+    def __init__(self, data: Any = None) -> None:
+        self.data = data
+        self.calls: list[tuple[str, Mapping[str, object] | None]] = []
+
+    def get_json(self, url: str, *, params: Mapping[str, object] | None = None) -> Any:
+        self.calls.append((url, params))
+        return self.data
+
+
+class SecidTests(unittest.TestCase):
+    def test_shanghai_prefixes(self) -> None:
+        self.assertEqual(to_secid("600519"), "1.600519")
+        self.assertEqual(to_secid("601138"), "1.601138")
+        self.assertEqual(to_secid("688981"), "1.688981")
+
+    def test_shenzhen_prefixes(self) -> None:
+        self.assertEqual(to_secid("000977"), "0.000977")
+        self.assertEqual(to_secid("002156"), "0.002156")
+        self.assertEqual(to_secid("300750"), "0.300750")
+        self.assertEqual(to_secid("159870"), "0.159870")
+
+    def test_exchange_suffixes(self) -> None:
+        self.assertEqual(to_secid("601138.SS"), "1.601138")
+        self.assertEqual(to_secid("601138.SH"), "1.601138")
+        self.assertEqual(to_secid("000977.SZ"), "0.000977")
+
+    def test_already_qualified_secid_passes_through(self) -> None:
+        self.assertEqual(to_secid("1.600519"), "1.600519")
+        self.assertEqual(to_secid("116.00700"), "116.00700")
+
+    def test_non_a_share_rejected(self) -> None:
+        for bad in ("NVDA", "43xxxx", "60051", "6005190"):
+            with self.assertRaises(ProviderError):
+                to_secid(bad)
+
+
+class QuoteTests(unittest.TestCase):
+    def test_prices_are_descaled_by_decimal_field(self) -> None:
+        client = FakeJsonClient(SAMPLE_QUOTE)
+        quote = EastmoneyProvider(http_client=client).get_quote(
+            EastmoneyQuoteQuery(symbol="002156")
+        )
+        self.assertEqual(quote.symbol, "002156")
+        self.assertEqual(quote.name, "通富微电")
+        self.assertAlmostEqual(quote.last, 76.64)
+        self.assertAlmostEqual(quote.prev_close, 69.82)
+        self.assertAlmostEqual(quote.high, 76.80)
+        self.assertAlmostEqual(quote.change, 6.82)
+        self.assertAlmostEqual(quote.change_pct, 9.77)
+        self.assertAlmostEqual(quote.pe_ttm, 88.36)
+        self.assertAlmostEqual(quote.turnover_rate_pct, 17.36)
+        self.assertEqual(quote.volume_lots, 2634097)
+
+    def test_sends_resolved_secid(self) -> None:
+        client = FakeJsonClient(SAMPLE_QUOTE)
+        EastmoneyProvider(http_client=client).get_quote(EastmoneyQuoteQuery(symbol="002156"))
+        _, params = client.calls[0]
+        self.assertEqual(params["secid"], "0.002156")
+
+    def test_missing_data_raises(self) -> None:
+        client = FakeJsonClient({"rc": 0, "data": None})
+        with self.assertRaises(ProviderError):
+            EastmoneyProvider(http_client=client).get_quote(
+                EastmoneyQuoteQuery(symbol="002156")
+            )
+
+
+class KlineTests(unittest.TestCase):
+    def test_parses_ohlcv_rows(self) -> None:
+        client = FakeJsonClient(SAMPLE_KLINE)
+        kline = EastmoneyProvider(http_client=client).get_history(
+            EastmoneyKlineQuery(symbol="002156", limit=2)
+        )
+        self.assertEqual(len(kline.bars), 2)
+        first = kline.bars[0]
+        self.assertEqual(first.date, "2026-07-22")
+        self.assertAlmostEqual(first.open, 71.71)
+        self.assertAlmostEqual(first.close, 74.90)
+        self.assertAlmostEqual(first.high, 76.23)
+        self.assertAlmostEqual(first.low, 70.88)
+        self.assertEqual(first.volume_lots, 2478838)
+
+    def test_period_and_adjust_map_to_api_codes(self) -> None:
+        client = FakeJsonClient(SAMPLE_KLINE)
+        EastmoneyProvider(http_client=client).get_history(
+            EastmoneyKlineQuery(symbol="002156", period="weekly", adjust="backward")
+        )
+        _, params = client.calls[0]
+        self.assertEqual(params["klt"], "102")
+        self.assertEqual(params["fqt"], "2")
+
+    def test_unknown_period_raises(self) -> None:
+        provider = EastmoneyProvider(http_client=FakeJsonClient(SAMPLE_KLINE))
+        with self.assertRaises(ProviderError):
+            provider.get_history(EastmoneyKlineQuery(symbol="002156", period="hourly"))
+
+    def test_short_row_raises(self) -> None:
+        client = FakeJsonClient({"data": {"code": "1", "name": "x", "klines": ["2026-07-22,1,2"]}})
+        with self.assertRaises(ProviderParseError):
+            EastmoneyProvider(http_client=client).get_history(
+                EastmoneyKlineQuery(symbol="002156")
+            )
+
+
+class FundFlowTests(unittest.TestCase):
+    def test_main_equals_large_plus_extra_large(self) -> None:
+        client = FakeJsonClient(SAMPLE_FUND_FLOW)
+        flow = EastmoneyProvider(http_client=client).get_fund_flow(
+            EastmoneyFundFlowQuery(symbol="002156", limit=1)
+        )
+        day = flow.days[0]
+        self.assertEqual(day.date, "2026-07-22")
+        self.assertAlmostEqual(day.main_net, day.large_net + day.extra_large_net, places=2)
+        self.assertAlmostEqual(day.extra_large_net, 3_594_000_000.0)
+        self.assertAlmostEqual(day.small_net, -920_000_000.0)
+        self.assertAlmostEqual(day.main_net_pct, 12.51)
+
+
+class SectorFlowTests(unittest.TestCase):
+    def test_ranks_by_main_net_inflow(self) -> None:
+        client = FakeJsonClient(SAMPLE_SECTOR)
+        sectors = EastmoneyProvider(http_client=client).list_sector_fund_flow(
+            EastmoneySectorFlowQuery(limit=2)
+        )
+        self.assertEqual([s.name for s in sectors], ["半导体", "集成电路封测"])
+        self.assertAlmostEqual(sectors[0].main_net_cny, 3305525504.0)
+        self.assertAlmostEqual(sectors[1].change_pct, 1.87)
+        _, params = client.calls[0]
+        self.assertEqual(params["fid"], "f62")
+        self.assertEqual(params["fs"], "m:90+t:2")
+
+    def test_concept_board_uses_different_filter(self) -> None:
+        client = FakeJsonClient(SAMPLE_SECTOR)
+        EastmoneyProvider(http_client=client).list_sector_fund_flow(
+            EastmoneySectorFlowQuery(kind="concept")
+        )
+        _, params = client.calls[0]
+        self.assertEqual(params["fs"], "m:90+t:3")
+
+    def test_unknown_kind_raises(self) -> None:
+        provider = EastmoneyProvider(http_client=FakeJsonClient(SAMPLE_SECTOR))
+        with self.assertRaises(ProviderError):
+            provider.list_sector_fund_flow(EastmoneySectorFlowQuery(kind="etf"))
+
+
+if __name__ == "__main__":
+    unittest.main()

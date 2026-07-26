@@ -14,7 +14,7 @@ Price is absolutely rational — when someone puts real money on an outcome, the
 
 This is the core insight of the Efficient Market Hypothesis: **all public information is already priced in. Everything is in the chart.**
 
-Digital Oracle turns this insight into an executable tool. It plugs into 12 authoritative financial data sources — **from prediction markets like Polymarket and Kalshi, to US Treasury yield curves, CFTC institutional positioning, SEC insider trades, central bank rates, and crypto derivatives.**
+Digital Oracle turns this insight into an executable tool. It plugs into 13 authoritative financial data sources — **from prediction markets like Polymarket and Kalshi, to US Treasury yield curves, CFTC institutional positioning, SEC insider trades, central bank rates, crypto derivatives, and China A-share order-size fund flow.**
 
 It doesn't read newspapers, news articles, short videos, or podcasts. It answers questions about housing prices, gold trends, Bitcoin cycles, and military conflict probabilities purely through price signals mined from financial data — delivering structured probability estimates with full reasoning chains.
 
@@ -46,6 +46,7 @@ If there's a market pricing an outcome, Digital Oracle can give you a probabilit
 | BIS | Central bank data | Policy rates, credit-to-GDP gaps |
 | World Bank | Development indicators | GDP, population, trade |
 | Yahoo Finance | US options chains | IV, Greeks, put/call ratio |
+| Eastmoney | China A-share | Quotes, OHLCV, order-size fund flow, sector rotation |
 | Web Search | Web search | VIX, CDS, and other supplementary data |
 
 All APIs are free and require no API keys.
@@ -102,7 +103,7 @@ digital-oracle/
 
 ## Design Principles
 
-- **Zero dependencies first** — 11/12 providers use only the Python standard library, no `pip install` needed
+- **Zero dependencies first** — 12/13 providers use only the Python standard library, no `pip install` needed
 - **Dependency injection** — all providers accept an optional `http_client` parameter for easy testing
 - **Partial failure tolerance** — one data source going down doesn't break the rest
 - **Snapshot testing** — record real HTTP responses, run tests offline in CI

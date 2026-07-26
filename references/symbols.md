@@ -101,6 +101,31 @@ VIX/MOVE 精确值推荐 web search — 搜 "VIX index current" / "MOVE index cu
 | `EWZ` | iShares MSCI Brazil ETF | 巴西/新兴市场 |
 | `EWA` | iShares MSCI Australia ETF | 大宗商品国 |
 
+## A 股（走 EastmoneyProvider，传裸 6 位代码）
+
+`to_secid()` 按前缀判交易所，无需自己拼后缀。若要与美股放在同一坐标系对比，
+YahooPriceProvider 也能取，用 `.SS`（上海）/ `.SZ`（深圳）后缀。
+
+| 代码段 | 交易所 | 板块 | 示例 |
+|--------|--------|------|------|
+| `600xxx` `601xxx` `603xxx` `605xxx` | 上海 | 主板 | `601138` 工业富联 |
+| `688xxx` | 上海 | 科创板 | `688981` 中芯国际 |
+| `000xxx` `001xxx` `002xxx` `003xxx` | 深圳 | 主板/中小板 | `002156` 通富微电 |
+| `300xxx` `301xxx` | 深圳 | 创业板 | `300750` 宁德时代 |
+| `51xxxx` `58xxxx` | 上海 | ETF | `510300` 沪深300ETF |
+| `15xxxx` `16xxxx` | 深圳 | ETF/LOF | `159870` 化工ETF |
+
+**板块代码**由 `list_sector_fund_flow()` 返回，形如 `BK1036`（半导体）、`BK1328`（集成电路封测），
+不用手工维护。
+
+**离岸对照信号：**
+
+| 符号 | 标的 | 信号含义 |
+|------|------|---------|
+| `FXI` | iShares China Large-Cap ETF | 外资对中国资产的风险定价 |
+| `USDCNY=X` | 美元/人民币 | 资本流向，下降=人民币走强=资本流入 |
+| `SOXX` | iShares Semiconductor ETF | 半导体产业链共振，A 股半导体的美股对照 |
+
 ## 需要 Web Search 的关键数据
 
 以下数据 YahooPriceProvider 无法提供，但对分析至关重要，需通过 web search 获取：

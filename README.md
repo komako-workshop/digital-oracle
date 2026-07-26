@@ -14,7 +14,7 @@ Digital Oracle 是一款让 AI Agent 基于从海量金融数据中，挖掘出�
 
 这就是有效市场理论的核心洞察：**所有公开信息都已经被价格消化了。一切信息都在 K 线里。**
 
-Digital Oracle 把这个洞察变成了一个可执行的工具。它接入了 12 个权威金融数据源 — **从 Polymarket 和 Kalshi 这样的预测市场，到美国国债收益率曲线、CFTC 机构持仓、SEC 内部人交易、各国央行利率、加密衍生品。**
+Digital Oracle 把这个洞察变成了一个可执行的工具。它接入了 13 个权威金融数据源 — **从 Polymarket 和 Kalshi 这样的预测市场，到美国国债收益率曲线、CFTC 机构持仓、SEC 内部人交易、各国央行利率、加密衍生品，以及 A 股的拆单资金流与板块轮动。**
 
 它不看报纸不读新闻，不消费文章、短视频、播客，只通过从金融数据中挖掘出的价值信号，来回答房价涨跌、黄金走势、比特币周期、军事冲突概率这类问题，并给出结构化的概率估计和推理链。
 
@@ -46,6 +46,7 @@ Digital Oracle 把这个洞察变成了一个可执行的工具。它接入了 1
 | BIS | 央行数据 | 政策利率、信贷/GDP 缺口 |
 | World Bank | 发展指标 | GDP、人口、贸易 |
 | Yahoo Finance | US 期权链 | IV、Greeks、put/call ratio |
+| Eastmoney | A 股行情与资金流 | 个股/ETF 行情、K 线、拆单量级资金流、板块轮动 |
 | Web Search | 网页搜索 | VIX、CDS 等补充数据 |
 
 所有 API 均免费、无需 API Key。
@@ -69,7 +70,7 @@ Agent 会自行 clone 代码、阅读方法论、调用 provider。
 ### 前置依赖
 
 - [uv](https://docs.astral.sh/uv/) — Python 包管理器，skill 运行时用它执行 Python 脚本
-- 12 个数据源中有 11 个零外部依赖（纯 Python 标准库）。期权链分析需要额外安装：
+- 13 个数据源中有 12 个零外部依赖（纯 Python 标准库）。期权链分析需要额外安装：
 
 ```bash
 uv pip install yfinance
@@ -92,7 +93,7 @@ digital-oracle/
 │   ├── concurrent.py       # 并行执行工具
 │   ├── http.py             # HTTP 客户端抽象
 │   ├── snapshots.py        # HTTP 响应录制/回放（测试用）
-│   └── providers/          # 12 个数据 provider
+│   └── providers/          # 13 个数据 provider
 ├── references/             # API 速查
 │   ├── providers.md        # Provider API 参考
 │   └── symbols.md          # 交易符号目录
@@ -102,7 +103,7 @@ digital-oracle/
 
 ## 设计原则
 
-- **零依赖优先** — 11/12 个 provider 只用 Python 标准库，无需 `pip install`
+- **零依赖优先** — 12/13 个 provider 只用 Python 标准库，无需 `pip install`
 - **依赖注入** — 所有 provider 接受可选的 `http_client` 参数，方便测试
 - **部分失败容忍** — 一个数据源挂了不影响其他结果
 - **快照测试** — 录制真实 HTTP 响应，CI 里无网络也能跑测试
