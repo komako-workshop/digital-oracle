@@ -7,17 +7,24 @@ fund flow and sector rotation. Free, keyless, JSON.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from digital_oracle.http import JsonHttpClient, UrllibJsonClient
 
 from ._coerce import _coerce_float, _coerce_int
 from .base import ProviderError, ProviderParseError, SignalProvider
 
-EASTMONEY_QUOTE_URL = "https://push2.eastmoney.com/api/qt/stock/get"
-EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-EASTMONEY_FUND_FLOW_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-EASTMONEY_SECTOR_URL = "https://push2.eastmoney.com/api/qt/clist/get"
+QUOTE_PATH = "/api/qt/stock/get"
+KLINE_PATH = "/api/qt/stock/kline/get"
+FUND_FLOW_PATH = "/api/qt/stock/fflow/daykline/get"
+SECTOR_PATH = "/api/qt/clist/get"
+
+# Eastmoney throttles the realtime hosts per source IP — a burst of requests from
+# one datacenter address gets 502s and connection timeouts within minutes. The
+# delay host stays up under the same load and serves every one of these paths, so
+# it is worth a second attempt before giving up. Its quotes lag ~15 minutes.
+LIVE_HOSTS = ("https://push2.eastmoney.com", "https://push2delay.eastmoney.com")
+HISTORY_HOSTS = ("https://push2his.eastmoney.com", "https://push2delay.eastmoney.com")
 
 # Eastmoney rejects the stdlib default agent, so every request needs a browser UA.
 _BROWSER_HEADERS = {
@@ -204,15 +211,43 @@ class EastmoneyProvider(SignalProvider):
             headers=_BROWSER_HEADERS
         )
 
+    def _fetch(
+        self,
+        hosts: Sequence[str],
+        path: str,
+        params: Mapping[str, Any],
+        *,
+        require: Callable[[Mapping[str, Any]], bool] | None = None,
+    ) -> Mapping[str, Any]:
+        """Try each host in turn; ``require`` rejects a 200 that carries no rows.
+
+        The delay host answers the kline path with an empty ``klines`` array
+        rather than an error, which would otherwise surface as a silently empty
+        chart instead of a failure worth reporting.
+        """
+        failures = []
+        for host in hosts:
+            try:
+                data = _payload(self.http_client.get_json(host + path, params=params))
+            except ProviderParseError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — try the next host, report all
+                failures.append(f"{host}: {type(exc).__name__}: {exc}")
+                continue
+            if require is not None and not require(data):
+                failures.append(f"{host}: responded 200 but carried no rows")
+                continue
+            return data
+        raise ProviderError("every Eastmoney host failed — " + "; ".join(failures))
+
     def get_quote(self, query: EastmoneyQuoteQuery) -> EastmoneyQuote:
-        data = _payload(
-            self.http_client.get_json(
-                EASTMONEY_QUOTE_URL,
-                params={
-                    "secid": to_secid(query.symbol),
-                    "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f59,f60,f116,f117,f162,f167,f168,f169,f170",
-                },
-            )
+        data = self._fetch(
+            LIVE_HOSTS,
+            QUOTE_PATH,
+            {
+                "secid": to_secid(query.symbol),
+                "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f59,f60,f116,f117,f162,f167,f168,f169,f170",
+            },
         )
         decimals = _coerce_int(data.get("f59"))
         return EastmoneyQuote(
@@ -245,19 +280,19 @@ class EastmoneyProvider(SignalProvider):
             raise ProviderError(
                 f"unknown adjust {query.adjust!r}; expected one of {sorted(_ADJUST_MODES)}"
             )
-        data = _payload(
-            self.http_client.get_json(
-                EASTMONEY_KLINE_URL,
-                params={
-                    "secid": to_secid(query.symbol),
-                    "fields1": "f1,f2,f3",
-                    "fields2": "f51,f52,f53,f54,f55,f56,f57",
-                    "klt": period,
-                    "fqt": adjust,
-                    "end": "20500101",
-                    "lmt": max(1, query.limit),
-                },
-            )
+        data = self._fetch(
+            HISTORY_HOSTS,
+            KLINE_PATH,
+            {
+                "secid": to_secid(query.symbol),
+                "fields1": "f1,f2,f3",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57",
+                "klt": period,
+                "fqt": adjust,
+                "end": "20500101",
+                "lmt": max(1, query.limit),
+            },
+            require=_has_rows,
         )
         bars = []
         for row in _rows(data):
@@ -282,17 +317,17 @@ class EastmoneyProvider(SignalProvider):
         )
 
     def get_fund_flow(self, query: EastmoneyFundFlowQuery) -> EastmoneyFundFlow:
-        data = _payload(
-            self.http_client.get_json(
-                EASTMONEY_FUND_FLOW_URL,
-                params={
-                    "secid": to_secid(query.symbol),
-                    "fields1": "f1,f2,f3,f7",
-                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-                    "klt": "101",
-                    "lmt": max(1, query.limit),
-                },
-            )
+        data = self._fetch(
+            HISTORY_HOSTS,
+            FUND_FLOW_PATH,
+            {
+                "secid": to_secid(query.symbol),
+                "fields1": "f1,f2,f3,f7",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                "klt": "101",
+                "lmt": max(1, query.limit),
+            },
+            require=_has_rows,
         )
         days = []
         for row in _rows(data):
@@ -323,21 +358,20 @@ class EastmoneyProvider(SignalProvider):
             raise ProviderError(
                 f"unknown sector kind {query.kind!r}; expected one of {sorted(_SECTOR_BOARDS)}"
             )
-        data = _payload(
-            self.http_client.get_json(
-                EASTMONEY_SECTOR_URL,
-                params={
-                    "fid": "f62",  # rank by main-force net inflow
-                    "po": 1,
-                    "pz": max(1, query.limit),
-                    "pn": 1,
-                    "np": 1,
-                    "fltt": 2,
-                    "invt": 2,
-                    "fs": board,
-                    "fields": "f3,f12,f14,f62,f184",
-                },
-            )
+        data = self._fetch(
+            LIVE_HOSTS,
+            SECTOR_PATH,
+            {
+                "fid": "f62",  # rank by main-force net inflow
+                "po": 1,
+                "pz": max(1, query.limit),
+                "pn": 1,
+                "np": 1,
+                "fltt": 2,
+                "invt": 2,
+                "fs": board,
+                "fields": "f3,f12,f14,f62,f184",
+            },
         )
         rows = data.get("diff")
         if not isinstance(rows, Sequence):
@@ -356,6 +390,11 @@ class EastmoneyProvider(SignalProvider):
                 )
             )
         return sectors
+
+
+def _has_rows(data: Mapping[str, Any]) -> bool:
+    klines = data.get("klines")
+    return isinstance(klines, Sequence) and not isinstance(klines, (str, bytes)) and bool(klines)
 
 
 def _rows(data: Mapping[str, Any]) -> Sequence[Any]:

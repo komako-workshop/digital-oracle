@@ -79,12 +79,15 @@ SAMPLE_SECTOR = {
 
 
 class FakeJsonClient:
-    def __init__(self, data: Any = None) -> None:
+    def __init__(self, data: Any = None, *, fail_hosts: tuple[str, ...] = ()) -> None:
         self.data = data
+        self.fail_hosts = fail_hosts
         self.calls: list[tuple[str, Mapping[str, object] | None]] = []
 
     def get_json(self, url: str, *, params: Mapping[str, object] | None = None) -> Any:
         self.calls.append((url, params))
+        if any(host in url for host in self.fail_hosts):
+            raise RuntimeError(f"simulated 502 from {url}")
         return self.data
 
 
@@ -144,6 +147,59 @@ class QuoteTests(unittest.TestCase):
             EastmoneyProvider(http_client=client).get_quote(
                 EastmoneyQuoteQuery(symbol="002156")
             )
+
+
+class HostFallbackTests(unittest.TestCase):
+    """Eastmoney throttles the realtime hosts per IP; the delay host must cover."""
+
+    def test_quote_falls_back_to_delay_host(self) -> None:
+        client = FakeJsonClient(SAMPLE_QUOTE, fail_hosts=("push2.eastmoney.com",))
+        quote = EastmoneyProvider(http_client=client).get_quote(
+            EastmoneyQuoteQuery(symbol="002156")
+        )
+        self.assertEqual(quote.name, "通富微电")
+        self.assertEqual(len(client.calls), 2)
+        self.assertIn("push2.eastmoney.com", client.calls[0][0])
+        self.assertIn("push2delay.eastmoney.com", client.calls[1][0])
+
+    def test_history_falls_back_to_delay_host(self) -> None:
+        client = FakeJsonClient(SAMPLE_KLINE, fail_hosts=("push2his.eastmoney.com",))
+        kline = EastmoneyProvider(http_client=client).get_history(
+            EastmoneyKlineQuery(symbol="002156")
+        )
+        self.assertEqual(len(kline.bars), 2)
+        self.assertIn("push2delay.eastmoney.com", client.calls[-1][0])
+
+    def test_primary_host_is_not_retried_when_it_works(self) -> None:
+        client = FakeJsonClient(SAMPLE_QUOTE)
+        EastmoneyProvider(http_client=client).get_quote(EastmoneyQuoteQuery(symbol="002156"))
+        self.assertEqual(len(client.calls), 1)
+
+    def test_empty_rows_from_fallback_is_a_failure_not_an_empty_chart(self) -> None:
+        """push2delay answers the kline path with klines: [] instead of an error."""
+
+        class EmptyThenNever:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def get_json(self, url: str, *, params: Any = None) -> Any:
+                self.calls.append(url)
+                return {"data": {"code": "002156", "name": "通富微电", "klines": []}}
+
+        client = EmptyThenNever()
+        provider = EastmoneyProvider(http_client=client)
+        with self.assertRaises(ProviderError) as ctx:
+            provider.get_history(EastmoneyKlineQuery(symbol="002156"))
+        self.assertIn("carried no rows", str(ctx.exception))
+        self.assertEqual(len(client.calls), 2)  # both hosts tried before giving up
+
+    def test_all_hosts_failing_reports_every_attempt(self) -> None:
+        client = FakeJsonClient(SAMPLE_QUOTE, fail_hosts=("eastmoney.com",))
+        provider = EastmoneyProvider(http_client=client)
+        with self.assertRaises(ProviderError) as ctx:
+            provider.get_quote(EastmoneyQuoteQuery(symbol="002156"))
+        self.assertIn("push2.eastmoney.com", str(ctx.exception))
+        self.assertIn("push2delay.eastmoney.com", str(ctx.exception))
 
 
 class KlineTests(unittest.TestCase):
