@@ -26,6 +26,14 @@ SECTOR_PATH = "/api/qt/clist/get"
 LIVE_HOSTS = ("https://push2.eastmoney.com", "https://push2delay.eastmoney.com")
 HISTORY_HOSTS = ("https://push2his.eastmoney.com", "https://push2delay.eastmoney.com")
 
+# OHLCV comes from Tencent first. push2his is the host Eastmoney throttles hardest
+# and the delay host answers the kline path with an empty array rather than an
+# error, so Eastmoney is the weaker source for exactly this one call. Tencent has
+# no such limit and ships the same field order (minus turnover).
+TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+_TENCENT_PERIODS = {"daily": "day", "weekly": "week", "monthly": "month"}
+_TENCENT_ADJUST = {"none": "", "forward": "qfq", "backward": "hfq"}
+
 # Eastmoney rejects the stdlib default agent, so every request needs a browser UA.
 _BROWSER_HEADERS = {
     "Accept": "application/json,text/plain,*/*",
@@ -195,7 +203,12 @@ def _payload(response: object) -> Mapping[str, Any]:
 
 @dataclass
 class EastmoneyProvider(SignalProvider):
-    """A-share quotes, OHLCV history, order-size fund flow and sector rotation."""
+    """A-share quotes, OHLCV history, order-size fund flow and sector rotation.
+
+    Quotes, fund flow and sector rotation come from Eastmoney. ``get_history``
+    prefers Tencent and only falls back to Eastmoney, because push2his is the
+    host Eastmoney throttles hardest and its delay host does not serve klines.
+    """
 
     provider_id: str = "eastmoney"
     display_name: str = "Eastmoney (China A-share)"
@@ -280,6 +293,40 @@ class EastmoneyProvider(SignalProvider):
             raise ProviderError(
                 f"unknown adjust {query.adjust!r}; expected one of {sorted(_ADJUST_MODES)}"
             )
+        limit = max(1, query.limit)
+        failures = []
+        try:
+            payload = self.http_client.get_json(
+                TENCENT_KLINE_URL,
+                params={
+                    "param": ",".join(
+                        [
+                            to_tencent_symbol(query.symbol),
+                            _TENCENT_PERIODS[query.period],
+                            "",
+                            "",
+                            str(limit),
+                            _TENCENT_ADJUST[query.adjust],
+                        ]
+                    )
+                },
+            )
+            bars = _tencent_bars(
+                payload, _TENCENT_PERIODS[query.period], _TENCENT_ADJUST[query.adjust]
+            )
+            return EastmoneyKline(
+                symbol=to_secid(query.symbol).partition(".")[2],
+                name="",  # Tencent's kline payload carries no display name
+                period=query.period,
+                adjust=query.adjust,
+                bars=bars,
+            )
+        except Exception as exc:  # noqa: BLE001 — any Tencent problem falls through
+            # Includes parse errors: for a fallback chain, a malformed response
+            # from the preferred source is a reason to try the next one, not to
+            # fail the call.
+            failures.append(f"{TENCENT_KLINE_URL}: {type(exc).__name__}: {exc}")
+
         data = self._fetch(
             HISTORY_HOSTS,
             KLINE_PATH,
@@ -290,7 +337,7 @@ class EastmoneyProvider(SignalProvider):
                 "klt": period,
                 "fqt": adjust,
                 "end": "20500101",
-                "lmt": max(1, query.limit),
+                "lmt": limit,
             },
             require=_has_rows,
         )
@@ -390,6 +437,42 @@ class EastmoneyProvider(SignalProvider):
                 )
             )
         return sectors
+
+
+def to_tencent_symbol(symbol: str) -> str:
+    """``600519`` -> ``sh600519``, ``002156`` -> ``sz002156``."""
+    market, _, code = to_secid(symbol).partition(".")
+    return ("sh" if market == "1" else "sz") + code
+
+
+def _tencent_bars(payload: object, period: str, adjust: str) -> tuple[EastmoneyBar, ...]:
+    if not isinstance(payload, Mapping):
+        raise ProviderParseError("expected Tencent response to be an object")
+    data = payload.get("data")
+    if not isinstance(data, Mapping) or not data:
+        raise ProviderError("Tencent returned no data for this code")
+    quote = next(iter(data.values()))
+    if not isinstance(quote, Mapping):
+        raise ProviderParseError("expected Tencent 'data' entry to be an object")
+    rows = quote.get(f"{adjust}{period}")
+    if not isinstance(rows, Sequence) or not rows:
+        raise ProviderError("Tencent returned no bars for this code")
+    bars = []
+    for row in rows:
+        if not isinstance(row, Sequence) or isinstance(row, (str, bytes)) or len(row) < 6:
+            raise ProviderParseError("expected Tencent kline row to have 6 fields")
+        bars.append(
+            EastmoneyBar(
+                date=str(row[0]),
+                open=_coerce_float(row[1]),
+                close=_coerce_float(row[2]),
+                high=_coerce_float(row[3]),
+                low=_coerce_float(row[4]),
+                volume_lots=_coerce_int(_coerce_float(row[5])),
+                turnover_cny=None,  # Tencent does not ship turnover on this endpoint
+            )
+        )
+    return tuple(bars)
 
 
 def _has_rows(data: Mapping[str, Any]) -> bool:

@@ -421,6 +421,7 @@ q = em.get_quote(EastmoneyQuoteQuery(symbol="002156"))
 k = em.get_history(EastmoneyKlineQuery(symbol="002156", period="daily", adjust="forward", limit=120))
 # 返回 EastmoneyKline；period: daily|weekly|monthly，adjust: none|forward|backward
 # k.bars[i].date/open/close/high/low/volume_lots/turnover_cny
+# 主源是腾讯（见下方注意事项），走腾讯时 turnover_cny 为 None、name 为空
 
 f = em.get_fund_flow(EastmoneyFundFlowQuery(symbol="002156", limit=20))
 # 返回 EastmoneyFundFlow，按日拆单量级的净流入（人民币，正=净买入）
@@ -446,10 +447,12 @@ s = em.list_sector_fund_flow(EastmoneySectorFlowQuery(kind="industry", limit=20)
 
 - 资金流数据**收盘后**才更新，盘中提问拿到的是昨天的数据。
 - 没有任何预测市场给 A 股个股定价——要概率只能从持仓与波动率推，查不到现成的。
-- 东财按来源 IP 限流，机房出口连发几十次就会开始 502 / 断连。provider 会自动回退到
-  延时主机 `push2delay`（行情延迟约 15 分钟），**行情、资金流、板块三类都能顶上，
-  唯独日 K 顶不了**——延时主机对 K 线路径返回 200 但 `klines` 是空数组。这种情况
-  provider 会明确抛错并列出试过的主机，而不是返回一张空图。
+- 东财按来源 IP 限流，机房出口连发几十次就会开始 502 / 断连。行情、资金流、板块
+  三类会自动回退到延时主机 `push2delay`（行情延迟约 15 分钟）。
+- **`get_history` 的主源是腾讯，不是东财。** `push2his` 是东财限流最狠的一台，
+  而延时主机对 K 线路径返回 200 但 `klines` 为空数组——对这一个调用东财是弱源。
+  腾讯 `web.ifzq.gtimg.cn` 没有这个限制，字段顺序一致（少一个成交额，所以走腾讯时
+  `turnover_cny` 为 `None`）。东财仍作为兜底，两边都失败才抛错并列出试过的源。
 
 ## CMEFedWatchProvider
 

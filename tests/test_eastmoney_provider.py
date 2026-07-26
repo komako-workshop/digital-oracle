@@ -78,9 +78,31 @@ SAMPLE_SECTOR = {
 }
 
 
+SAMPLE_TENCENT_KLINE = {
+    "code": 0,
+    "data": {
+        "sz002156": {
+            "qfqday": [
+                ["2026-07-22", "71.710", "74.900", "76.230", "70.880", "2478838.000"],
+                ["2026-07-23", "75.990", "69.820", "76.780", "69.300", "2057105.000"],
+            ]
+        }
+    },
+}
+
+
 class FakeJsonClient:
-    def __init__(self, data: Any = None, *, fail_hosts: tuple[str, ...] = ()) -> None:
+    """Serves the Tencent sample to gtimg URLs and the Eastmoney sample elsewhere."""
+
+    def __init__(
+        self,
+        data: Any = None,
+        *,
+        fail_hosts: tuple[str, ...] = (),
+        tencent_data: Any = None,
+    ) -> None:
         self.data = data
+        self.tencent_data = tencent_data
         self.fail_hosts = fail_hosts
         self.calls: list[tuple[str, Mapping[str, object] | None]] = []
 
@@ -88,6 +110,10 @@ class FakeJsonClient:
         self.calls.append((url, params))
         if any(host in url for host in self.fail_hosts):
             raise RuntimeError(f"simulated 502 from {url}")
+        if "gtimg.cn" in url:
+            if self.tencent_data is None:
+                raise RuntimeError("simulated Tencent outage")
+            return self.tencent_data
         return self.data
 
 
@@ -163,7 +189,7 @@ class HostFallbackTests(unittest.TestCase):
         self.assertIn("push2delay.eastmoney.com", client.calls[1][0])
 
     def test_history_falls_back_to_delay_host(self) -> None:
-        client = FakeJsonClient(SAMPLE_KLINE, fail_hosts=("push2his.eastmoney.com",))
+        client = FakeJsonClient(SAMPLE_KLINE, fail_hosts=("push2his.eastmoney.com", "gtimg.cn"))
         kline = EastmoneyProvider(http_client=client).get_history(
             EastmoneyKlineQuery(symbol="002156")
         )
@@ -184,6 +210,8 @@ class HostFallbackTests(unittest.TestCase):
 
             def get_json(self, url: str, *, params: Any = None) -> Any:
                 self.calls.append(url)
+                if "gtimg.cn" in url:
+                    raise RuntimeError("simulated Tencent outage")
                 return {"data": {"code": "002156", "name": "通富微电", "klines": []}}
 
         client = EmptyThenNever()
@@ -191,7 +219,7 @@ class HostFallbackTests(unittest.TestCase):
         with self.assertRaises(ProviderError) as ctx:
             provider.get_history(EastmoneyKlineQuery(symbol="002156"))
         self.assertIn("carried no rows", str(ctx.exception))
-        self.assertEqual(len(client.calls), 2)  # both hosts tried before giving up
+        self.assertEqual(len(client.calls), 3)  # Tencent + both Eastmoney hosts
 
     def test_all_hosts_failing_reports_every_attempt(self) -> None:
         client = FakeJsonClient(SAMPLE_QUOTE, fail_hosts=("eastmoney.com",))
@@ -203,7 +231,37 @@ class HostFallbackTests(unittest.TestCase):
 
 
 class KlineTests(unittest.TestCase):
-    def test_parses_ohlcv_rows(self) -> None:
+    def test_prefers_tencent_and_parses_its_rows(self) -> None:
+        client = FakeJsonClient(SAMPLE_KLINE, tencent_data=SAMPLE_TENCENT_KLINE)
+        kline = EastmoneyProvider(http_client=client).get_history(
+            EastmoneyKlineQuery(symbol="002156", limit=2)
+        )
+        self.assertIn("gtimg.cn", client.calls[0][0])
+        self.assertEqual(len(client.calls), 1)  # Eastmoney not touched
+        self.assertEqual(len(kline.bars), 2)
+        self.assertAlmostEqual(kline.bars[0].open, 71.71)
+        self.assertAlmostEqual(kline.bars[0].close, 74.90)
+        self.assertEqual(kline.bars[0].volume_lots, 2478838)
+        self.assertIsNone(kline.bars[0].turnover_cny)
+
+    def test_tencent_param_encodes_market_period_and_adjust(self) -> None:
+        client = FakeJsonClient(SAMPLE_KLINE, tencent_data=SAMPLE_TENCENT_KLINE)
+        EastmoneyProvider(http_client=client).get_history(
+            EastmoneyKlineQuery(symbol="601138", period="weekly", adjust="backward", limit=5)
+        )
+        self.assertEqual(client.calls[0][1]["param"], "sh601138,week,,,5,hfq")
+
+    def test_falls_back_to_eastmoney_when_tencent_is_down(self) -> None:
+        client = FakeJsonClient(SAMPLE_KLINE)  # tencent_data=None -> Tencent raises
+        kline = EastmoneyProvider(http_client=client).get_history(
+            EastmoneyKlineQuery(symbol="002156", limit=2)
+        )
+        self.assertIn("gtimg.cn", client.calls[0][0])
+        self.assertIn("eastmoney.com", client.calls[1][0])
+        self.assertEqual(len(kline.bars), 2)
+        self.assertAlmostEqual(kline.bars[0].turnover_cny, 18000000000.0)
+
+    def test_parses_eastmoney_rows_on_fallback(self) -> None:
         client = FakeJsonClient(SAMPLE_KLINE)
         kline = EastmoneyProvider(http_client=client).get_history(
             EastmoneyKlineQuery(symbol="002156", limit=2)
@@ -222,7 +280,7 @@ class KlineTests(unittest.TestCase):
         EastmoneyProvider(http_client=client).get_history(
             EastmoneyKlineQuery(symbol="002156", period="weekly", adjust="backward")
         )
-        _, params = client.calls[0]
+        _, params = client.calls[1]  # calls[0] is the Tencent attempt
         self.assertEqual(params["klt"], "102")
         self.assertEqual(params["fqt"], "2")
 
@@ -233,6 +291,7 @@ class KlineTests(unittest.TestCase):
 
     def test_short_row_raises(self) -> None:
         client = FakeJsonClient({"data": {"code": "1", "name": "x", "klines": ["2026-07-22,1,2"]}})
+        # Tencent has no data in this fixture, so the Eastmoney parser runs
         with self.assertRaises(ProviderParseError):
             EastmoneyProvider(http_client=client).get_history(
                 EastmoneyKlineQuery(symbol="002156")
